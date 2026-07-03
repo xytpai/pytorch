@@ -2349,6 +2349,22 @@ def ensure_cute_available() -> bool:
 
 
 @functools.lru_cache(maxsize=1)
+def ensure_flydsl_available() -> bool:
+    """Check if FlyDSL is importable; cache the result for reuse.
+
+    Call ensure_flydsl_available.cache_clear() after installing FlyDSL
+    in the same interpreter to retry the import.
+    """
+    from torch._inductor.runtime.flydsl_gemm import _add_flydsl_paths
+
+    _add_flydsl_paths()
+    try:
+        return importlib.util.find_spec("flydsl") is not None
+    except ImportError:
+        return False
+
+
+@functools.lru_cache(maxsize=1)
 def ensure_nv_universal_gemm_available() -> bool:
     """Check if NVIDIA Universal GEMM (cutlass_api) is importable; cache the result for reuse.
 
@@ -2574,6 +2590,50 @@ def use_nv_universal_gemm_template(
     return True
 
 
+def use_flydsl_gemm_template(
+    layout: Layout,
+    m: _IntLike,
+    n: _IntLike,
+    k: _IntLike,
+) -> bool:
+    """
+    Return True if we can use the initial FlyDSL GEMM extern backend.
+
+    The first integration is intentionally conservative: it only targets static
+    ROCm fp16/bf16 GEMMs matching the currently available FlyDSL tile kernels.
+    """
+    from .virtualized import V
+
+    if not _use_autotune_backend("FLYDSL"):
+        return False
+
+    if not ensure_flydsl_available():
+        return False
+
+    if not torch.version.hip or layout.device.type != "cuda":
+        return False
+
+    if not (config.max_autotune or config.max_autotune_gemm):
+        return False
+
+    if layout.dtype not in (torch.float16, torch.bfloat16):
+        return False
+
+    if V.aot_compilation:
+        return False
+
+    m_hint = V.graph.sizevars.optimization_hint(m, fallback=-1)
+    n_hint = V.graph.sizevars.optimization_hint(n, fallback=-1)
+    k_hint = V.graph.sizevars.optimization_hint(k, fallback=-1)
+    if not all(isinstance(x, int) and x > 0 for x in (m_hint, n_hint, k_hint)):
+        return False
+
+    # RDNA kernels use 128x128x32 tiles and require at least two K tiles.
+    # CDNA split-K also expects tile-aligned N/K, so keep one shared gate for
+    # the initial backend.
+    return m_hint % 128 == 0 and n_hint % 128 == 0 and k_hint % 64 == 0
+
+
 def _use_cutlass_for_op(op_name: str) -> bool:
     """Check if CUTLASS should be used for the given operation."""
     enabled_ops = config.cutlass.cutlass_enabled_ops.upper()
@@ -2690,14 +2750,6 @@ def get_k_splits(m: _IntLike, n: _IntLike, k: _IntLike) -> list[int]:
 @functools.cache
 def _rocm_native_device_arch_name(device: str) -> str:
     return torch.cuda.get_device_properties(device).gcnArchName
-
-
-@functools.lru_cache
-def using_rocm_rdna3() -> bool:
-    """Returns true if the device is based on RDNA3, otherwise returns false."""
-    return torch.cuda.is_available() and _rocm_native_device_arch_name(
-        "cuda"
-    ).startswith("gfx11")
 
 
 @functools.cache
