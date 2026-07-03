@@ -51,6 +51,7 @@ from ..utils import (
     use_cpp_gemm_template,
     use_cutlass_template,
     use_decompose_k_choice,
+    use_flydsl_gemm_template,
     use_nv_universal_gemm_template,
     use_triton_blackwell_tma_template,
     use_triton_scaling_template,
@@ -163,6 +164,21 @@ aten__sparse_semi_structured_mm = ExternKernelChoice(
 aten__fp8_mm = ExternKernelChoice(
     torch._scaled_mm, "at::_scaled_mm_out", op_overload=aten._scaled_mm.out
 )
+
+
+def flydsl_mm(mat1, mat2, *, out=None):
+    from torch._inductor.runtime.flydsl_gemm import mm as flydsl_runtime_mm
+
+    if out is None:
+        out = torch.empty(
+            (mat1.shape[0], mat2.shape[1]),
+            device=mat1.device,
+            dtype=mat1.dtype,
+        )
+    return flydsl_runtime_mm(mat1, mat2, out=out)
+
+
+flydsl_aten_mm = ExternKernelChoice(flydsl_mm, None)
 
 
 def _is_int8_mat(mat):
@@ -465,6 +481,14 @@ def tuned_mm(mat1, mat2, out_dtype=None, *, layout=None):
         CKGemmTemplate.add_ck_gemm_choices(choices, layout, kernel_inputs.nodes())
     if out_dtype is None and is_nonzero and use_ck_tile_gemm_template(layout, m, n, k):
         CKTileGemmTemplate.add_choices(choices, layout, kernel_inputs.nodes())
+
+    if (
+        out_dtype is None
+        and is_nonzero
+        and static_shape
+        and use_flydsl_gemm_template(layout, m, n, k)
+    ):
+        choices.append(flydsl_aten_mm.bind(kernel_inputs.nodes(), layout))
 
     if (
         out_dtype is None
