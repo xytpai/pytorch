@@ -177,6 +177,21 @@ aten__fp8_mm = ExternKernelChoice(
 )
 
 
+def flydsl_mm(mat1, mat2, *, out=None):
+    from torch._inductor.runtime.flydsl_gemm import mm as flydsl_runtime_mm
+
+    if out is None:
+        out = torch.empty(
+            (mat1.shape[0], mat2.shape[1]),
+            device=mat1.device,
+            dtype=mat1.dtype,
+        )
+    return flydsl_runtime_mm(mat1, mat2, out=out)
+
+
+flydsl_aten_mm = ExternKernelChoice(flydsl_mm, None)
+
+
 def _is_int8_mat(mat):
     return mat.get_dtype() in (torch.int8, torch.uint8)
 
@@ -628,6 +643,14 @@ def tuned_mm(mat1, mat2, out_dtype=None, *, layout=None):
                     layout=layout,
                     **flydsl_kwargs,
                 )
+
+    if (
+        out_dtype is None
+        and is_nonzero
+        and static_shape
+        and use_flydsl_gemm_template(layout, m, n, k)
+    ):
+        choices.append(flydsl_aten_mm.bind(kernel_inputs.nodes(), layout))
 
     if (
         out_dtype is None
